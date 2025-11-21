@@ -1,72 +1,69 @@
+# nata_streamlit_no_models.py
+# Minimal Streamlit UI that DOES NOT load pretrained .pkl files (avoids large binaries).
+# Instead: if predictions are needed, it trains small, in-memory models on demand
+# (no model files written). This avoids uploading large .pkl to GitHub.
+#
+# Expectation: Put df_cleaned.csv in the same GitHub repo/folder as the app:
+#   df_cleaned.csv
+#
+# Usage:
+#   streamlit run nata_streamlit_no_models.py
 
 import streamlit as st
 from pathlib import Path
 import pandas as pd
 import numpy as np
-import joblib
+
+# Scikit-learn imports used only when training on-demand
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.neighbors import NearestNeighbors
 
-st.set_page_config(layout="wide", page_title="NATA Supermarket - Simple UI")
+st.set_page_config(layout="wide", page_title="NATA Supermarket — No External Models")
 
-# ------------------ CONFIG (exact user paths) ------------------
-DATA_CSV = Path("/content/drive/My Drive/Code PPA/Nata Supermarket/df_cleaned.csv")
-MODELS_DIR = Path("/content/drive/My Drive/Nata_Supermarket_Trained_Models")
-OUTPUT_PRED_CSV = Path("/content/drive/My Drive/Code PPA/Nata Supermarket/df_with_preds.csv")
-# ---------------------------------------------------------------
-
-st.title("NATA Supermarket — Simple Prediction UI")
-st.markdown(f"Data: `{DATA_CSV}`  |  Models dir: `{MODELS_DIR}`")
+# ------------------ CONFIG: local repo-relative CSV ------------------
+DATA_CSV = Path("df_cleaned.csv")   # file must be in the same GitHub repo/folder
+st.title("NATA Supermarket — Simple UI (no external .pkl models)")
 
 # Load data
 if not DATA_CSV.exists():
-    st.error(f"df_cleaned.csv not found at {DATA_CSV}")
+    st.error(f"df_cleaned.csv not found at repo path: {DATA_CSV}\nPlease upload the CSV into the repository.")
     st.stop()
 
 df = pd.read_csv(DATA_CSV)
 df_cleaned = df.copy()
 
-# ensure TotalSpending convenience column (if Mnt* exist)
-mnt_cols = [c for c in df_cleaned.columns if c.startswith("Mnt")]
+# convenience: derive TotalSpending if Mnt* present
+mnt_cols = [c for c in df_cleaned.columns if c.lower().startswith("mnt")]
 if "TotalSpending" not in df_cleaned.columns:
     if mnt_cols:
         df_cleaned["TotalSpending"] = df_cleaned[mnt_cols].sum(axis=1)
     else:
         df_cleaned["TotalSpending"] = 0.0
 
-# Detect columns
+# detect columns
 numeric_cols = df_cleaned.select_dtypes(include=[np.number]).columns.tolist()
-categorical_cols = df_cleaned.select_dtypes(include=["object","category"]).columns.tolist()
-
-# List model files
-if MODELS_DIR.exists():
-    model_files = sorted([p for p in MODELS_DIR.iterdir() if p.suffix.lower() in (".pkl", ".joblib")])
-else:
-    model_files = []
+categorical_cols = df_cleaned.select_dtypes(include=['object','category']).columns.tolist()
 
 st.sidebar.header("Controls")
-st.sidebar.write("Found models:", [p.name for p in model_files] if model_files else "None")
+st.sidebar.write(f"Rows: {df_cleaned.shape[0]}  Columns: {df_cleaned.shape[1]}")
 
-# Choose model target (derived from filenames if possible) or select Mnt columns
-available_targets = []
-for p in model_files:
-    stem = p.stem
-    if stem.lower().startswith("model_"):
-        available_targets.append(stem[len("model_"):])
-    else:
-        available_targets.append(stem)
-if not available_targets:
-    available_targets = [c for c in df_cleaned.columns if c.startswith("Mnt")]
+# choose a numeric target (MNT variable or Income/TotalSpending)
+default_targets = [c for c in df_cleaned.columns if c.startswith("Mnt")]
+if "Income" in df_cleaned.columns:
+    default_targets.insert(0, "Income")
+if "TotalSpending" in df_cleaned.columns:
+    default_targets.insert(0, "TotalSpending")
+default_targets = list(dict.fromkeys(default_targets))  # keep order unique
 
-chosen_target = st.sidebar.selectbox("Choose model/target", options=available_targets)
+target = st.sidebar.selectbox("Choose numeric target to predict (will train on-demand)", options=default_targets or numeric_cols, index=0)
 
-# Map chosen target to a file path if present
-chosen_model_path = None
-for p in model_files:
-    if chosen_target.lower() in p.stem.lower():
-        chosen_model_path = p
-        break
-
-# New-customer input form
+# user input form produced from df_cleaned columns
 st.sidebar.subheader("New customer input")
 user_input = {}
 with st.sidebar.form("input_form"):
@@ -83,13 +80,14 @@ with st.sidebar.form("input_form"):
         if mn == mx:
             user_input[c] = st.number_input(c, value=med)
         else:
+            # slider sometimes fails on very large ranges; use try/except
             try:
                 user_input[c] = st.slider(c, min_value=mn, max_value=mx, value=med)
             except Exception:
                 user_input[c] = st.number_input(c, value=med)
-    submit = st.form_submit_button("Apply inputs")
+    submit_inputs = st.form_submit_button("Apply inputs")
 
-# Main layout: left preview, right actions
+# main layout
 left, right = st.columns([2,1])
 with left:
     st.subheader("Dataset preview")
@@ -97,15 +95,17 @@ with left:
 
 with right:
     st.subheader("Quick info")
-    st.write(f"Rows: {df_cleaned.shape[0]}")
-    st.write(f"Columns: {df_cleaned.shape[1]}")
-    st.write("Mnt columns:", mnt_cols)
+    st.write("Mnt columns detected:", mnt_cols)
+    st.write("Numeric columns count:", len(numeric_cols))
+    st.write("Categorical columns count:", len(categorical_cols))
 
-# Similar customers (numeric)
-if submit:
-    st.subheader("Similar customers (numeric features)")
-    num_df = df_cleaned[numeric_cols].fillna(df_cleaned[numeric_cols].median())
-    if len(numeric_cols) > 0:
+# similarity search if user provided input
+if submit_inputs:
+    st.subheader("Similar customers (by numeric features)")
+    if len(numeric_cols) == 0:
+        st.info("No numeric columns available for similarity.")
+    else:
+        num_df = df_cleaned[numeric_cols].fillna(df_cleaned[numeric_cols].median())
         nbrs = NearestNeighbors(n_neighbors=6).fit(num_df.values)
         inp = {k: v for k, v in user_input.items() if k in numeric_cols}
         inp_df = pd.DataFrame([inp])
@@ -117,69 +117,80 @@ if submit:
         sim = df_cleaned.iloc[indices[0][1:6]].copy()
         sim["distance"] = distances[0][1:6]
         st.dataframe(sim.reset_index(drop=True))
-    else:
-        st.info("No numeric columns available for similarity.")
 
-# Single prediction using chosen pretrained model
-st.subheader("Predict using pretrained model")
-if st.button("Predict for new customer"):
-    if chosen_model_path is None:
-        st.error("No model file found for the selected target.")
-    else:
+# On-demand lightweight training + predict (no saving of models).
+st.subheader("Train lightweight model on-demand & predict (no external .pkl required)")
+st.markdown("This will train a small model in-memory (no artifact files). Use this if you cannot upload large .pkl files to GitHub/Streamlit Cloud.")
+
+train_button = st.button("Train & Predict (lightweight)")
+
+if train_button:
+    # Prepare X, y
+    X = df_cleaned.drop(columns=[target]) if target in df_cleaned.columns else df_cleaned.drop(columns=[target])
+    y = df_cleaned[target].fillna(df_cleaned[target].median())
+
+    # identify numeric & categorical features for pipeline
+    num_feats = X.select_dtypes(include=[np.number]).columns.tolist()
+    cat_feats = X.select_dtypes(include=['object','category']).columns.tolist()
+
+    # Keep the pipeline light: fewer trees and simple imputers
+    numeric_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ])
+    categorical_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse=False))
+    ])
+
+    preprocessor = ColumnTransformer(transformers=[
+        ("num", numeric_transformer, num_feats),
+        ("cat", categorical_transformer, cat_feats)
+    ], sparse_threshold=0)
+
+    model = Pipeline([
+        ("preprocessor", preprocessor),
+        ("rf", RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=1))  # lightweight
+    ])
+
+    # Split and train (small train for speed)
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        model.fit(X_train, y_train)
+        preds = model.predict(X_test)
+        mae = mean_absolute_error(y_test, preds)
+        r2 = r2_score(y_test, preds)
+        st.write(f"Lightweight model trained — MAE: {mae:.3f}, R2: {r2:.3f}")
+    except Exception as e:
+        st.error(f"Training failed: {e}")
+        st.stop()
+
+    # predict for the provided new customer if inputs exist
+    if submit_inputs:
+        new_row = pd.DataFrame([user_input])
+        # ensure columns exist for pipeline
+        for c in X.columns:
+            if c not in new_row.columns:
+                new_row[c] = np.nan
+        new_row = new_row[X.columns]
         try:
-            model = joblib.load(chosen_model_path)
+            pred_new = model.predict(new_row)[0]
+            st.success(f"Predicted {target} for provided customer: {pred_new:.3f}")
         except Exception as e:
-            st.error(f"Failed to load model {chosen_model_path}: {e}")
-            model = None
+            st.error(f"Prediction on new input failed: {e}")
 
-        if model is not None:
-            new_row = pd.DataFrame([user_input])
-            for c in df_cleaned.columns:
-                if c not in new_row.columns:
-                    new_row[c] = np.nan
-            new_row = new_row[df_cleaned.columns]
-
-            pred = None
-            try:
-                pred = model.predict(new_row)[0]
-            except Exception:
-                try:
-                    num_cols = new_row.select_dtypes(include=[np.number]).columns
-                    pred = model.predict(new_row[num_cols].fillna(df_cleaned[num_cols].median()))[0]
-                except Exception as e2:
-                    st.error(f"Prediction failed: {e2}")
-
-            if pred is not None:
-                st.success(f"Predicted {chosen_target}: {pred:.4f}")
-            else:
-                st.error("Prediction did not return a value.")
-
-# Batch predict all models
-st.subheader("Batch predict (all models) and save")
-if st.button("Run batch prediction and save to Drive"):
-    if not model_files:
-        st.error("No model files found in models directory.")
-    else:
-        out_df = df_cleaned.copy()
-        failed = []
-        for p in model_files:
-            try:
-                m = joblib.load(p)
-                try:
-                    preds = m.predict(df_cleaned)
-                except Exception:
-                    num_cols = df_cleaned.select_dtypes(include=[np.number]).columns
-                    preds = m.predict(df_cleaned[num_cols].fillna(df_cleaned[num_cols].median()))
-                out_col = f"pred_{p.stem}"
-                out_df[out_col] = preds
-            except Exception as e:
-                failed.append((p.name, str(e)))
+    # optional: batch-predict the whole df and offer download (no model files written)
+    if st.checkbox("Batch predict entire dataset (adds columns to in-memory copy)"):
         try:
-            out_df.to_csv(OUTPUT_PRED_CSV, index=False)
-            st.success(f"Saved predictions to {OUTPUT_PRED_CSV}")
-            if failed:
-                st.warning(f"Some models failed: {failed}")
+            all_preds = model.predict(X)
+            out = df_cleaned.copy()
+            out[f"pred_{target}"] = all_preds
+            # provide download button for user to download CSV
+            csv = out.to_csv(index=False).encode('utf-8')
+            st.download_button("Download predictions CSV", data=csv, file_name=f"df_with_pred_{target}.csv", mime="text/csv")
+            st.success("Batch predictions ready for download (no files written to server).")
         except Exception as e:
-            st.error(f"Failed to save predictions CSV: {e}")
+            st.error(f"Batch prediction failed: {e}")
 
-st.markdown("Done.")
+st.markdown("---")
+st.markdown("Notes: this app trains small models in RAM on-demand. If you need production-grade performance or persistent models, consider storing model artifacts in an external object store (S3, Azure Blob) and load them at runtime.")
